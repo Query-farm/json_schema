@@ -1,6 +1,7 @@
 {
         "dependencies": [
-                "openssl"
+                "json-schema-validator",
+                "nlohmann-json"
         ],
         "vcpkg-configuration": {
                 "overlay-ports": [

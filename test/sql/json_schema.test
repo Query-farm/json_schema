@@ -1,0 +1,80 @@
+# name: test/sql/json_schema.test
+# description: test json_schema extension
+# group: [sql]
+
+# Require statement will ensure this test is run with this extension loaded
+require json_schema
+
+require json
+
+# This function validates a JSON schema.
+query I
+SELECT json_schema_validate_schema('{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "User Profile",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "A unique identifier for the user"
+    }
+  }
+}')
+----
+True
+
+# This validates a JSON value against a JSON schema.  The first
+# argument is the schema the second is the value to validate.
+query T
+SELECT json_schema_validate('{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "User Profile",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "A unique identifier for the user"
+    }
+  }
+}', {'id': 5})
+----
+True
+
+
+# This function calculates the JSON patch that should be
+# applied to the JSON data from the JSON schema.
+# The JSON schema is the first parameter, the value is the second.
+query T
+SELECT json_schema_patch('{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "User Profile",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "A unique identifier for the user",
+      "default": 5
+    }
+  }
+}', {'name': 'George'})
+----
+[{"op":"add","path":"/id","value":5}]
+
+
+# This function updates the JSON to conform to the JSON schema
+# adding any missing default values.
+query T
+SELECT json_schema_update('{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "User Profile",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "A unique identifier for the user",
+      "default": 5
+    }
+  }
+}', {'name': 'George'})
+----
+{"id":5,"name":"George"}
