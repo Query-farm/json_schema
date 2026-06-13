@@ -6,6 +6,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include "nlohmann/json-schema.hpp"
+#include "query_farm_telemetry.hpp"
 
 namespace duckdb {
 
@@ -101,6 +102,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(ScalarFunction("json_schema_update", {LogicalType::JSON(), LogicalType::JSON()},
 	                                       LogicalType::JSON(), JsonSchemaUpdateFun));
+
+	QueryFarmSendTelemetry(loader, "json_schema", "20260613");
 }
 
 void JsonSchemaExtension::Load(ExtensionLoader &loader) {
