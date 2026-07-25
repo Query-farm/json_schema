@@ -103,7 +103,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction("json_schema_update", {LogicalType::JSON(), LogicalType::JSON()},
 	                                       LogicalType::JSON(), JsonSchemaUpdateFun));
 
-	QueryFarmSendTelemetry(loader, "json_schema", "20260613");
+	QueryFarmSendTelemetry(loader, "json_schema", "2026072501");
 }
 
 void JsonSchemaExtension::Load(ExtensionLoader &loader) {
@@ -114,7 +114,7 @@ std::string JsonSchemaExtension::Name() {
 }
 
 std::string JsonSchemaExtension::Version() const {
-	return "2025102401";
+	return "2026072501";
 }
 
 } // namespace duckdb
