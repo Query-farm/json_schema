@@ -113,7 +113,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	update.SetFallible();
 	loader.RegisterFunction(update);
 
-	QueryFarmSendTelemetry(loader, "json_schema", "2026072501");
+	QueryFarmSendTelemetry(loader, "json_schema", "2026102001");
 }
 
 void JsonSchemaExtension::Load(ExtensionLoader &loader) {
@@ -124,7 +124,7 @@ std::string JsonSchemaExtension::Name() {
 }
 
 std::string JsonSchemaExtension::Version() const {
-	return "2026072501";
+	return "2026102001";
 }
 
 } // namespace duckdb
