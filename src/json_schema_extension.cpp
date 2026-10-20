@@ -5,6 +5,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "duckdb/common/vector/string_vector.hpp"
 #include "nlohmann/json-schema.hpp"
 #include "query_farm_telemetry.hpp"
 
@@ -14,7 +15,7 @@ inline void JsonSchemaValidateSchemaFun(DataChunk &args, ExpressionState &state,
 	auto &schema_vector = args.data[0];
 
 	nlohmann::json_schema::json_validator validator;
-	UnaryExecutor::Execute<string_t, bool>(schema_vector, result, args.size(), [&](string_t schema) {
+	UnaryExecutor::Execute<string_t, bool>(schema_vector, result, [&](string_t schema) {
 		try {
 			nlohmann::json parsed = nlohmann::json::parse(schema.GetString());
 			validator.set_root_schema(parsed);
@@ -31,7 +32,7 @@ inline void JsonSchemaValidateFun(DataChunk &args, ExpressionState &state, Vecto
 	auto &value_vector = args.data[1];
 
 	BinaryExecutor::Execute<string_t, string_t, bool>(
-	    schema_vector, value_vector, result, args.size(), [&](string_t schema, string_t value) {
+	    schema_vector, value_vector, result, [&](string_t schema, string_t value) {
 		    try {
 			    nlohmann::json_schema::json_validator validator; // create validator
 			    nlohmann::json parsed_schema = nlohmann::json::parse(schema.GetString());
@@ -52,7 +53,7 @@ inline void JsonSchemaPatchFun(DataChunk &args, ExpressionState &state, Vector &
 	auto &value_vector = args.data[1];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    schema_vector, value_vector, result, args.size(), [&](string_t schema, string_t value) {
+	    schema_vector, value_vector, result, [&](string_t schema, string_t value) {
 		    try {
 			    nlohmann::json_schema::json_validator validator; // create validator
 			    nlohmann::json parsed_schema = nlohmann::json::parse(schema.GetString());
@@ -73,7 +74,7 @@ inline void JsonSchemaUpdateFun(DataChunk &args, ExpressionState &state, Vector 
 	auto &value_vector = args.data[1];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    schema_vector, value_vector, result, args.size(), [&](string_t schema, string_t value) {
+	    schema_vector, value_vector, result, [&](string_t schema, string_t value) {
 		    try {
 			    nlohmann::json_schema::json_validator validator; // create validator
 			    nlohmann::json parsed_schema = nlohmann::json::parse(schema.GetString());
@@ -91,17 +92,26 @@ inline void JsonSchemaUpdateFun(DataChunk &args, ExpressionState &state, Vector 
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction("json_schema_validate_schema", {LogicalType::JSON()}, LogicalType::BOOLEAN,
-	                                       JsonSchemaValidateSchemaFun));
+	// All functions raise an error on invalid JSON / schemas, so they must be marked as fallible.
+	ScalarFunction validate_schema("json_schema_validate_schema", {LogicalType::JSON()}, LogicalType::BOOLEAN,
+	                               JsonSchemaValidateSchemaFun);
+	validate_schema.SetFallible();
+	loader.RegisterFunction(validate_schema);
 
-	loader.RegisterFunction(ScalarFunction("json_schema_validate", {LogicalType::JSON(), LogicalType::JSON()},
-	                                       LogicalType::BOOLEAN, JsonSchemaValidateFun));
+	ScalarFunction validate("json_schema_validate", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::BOOLEAN,
+	                        JsonSchemaValidateFun);
+	validate.SetFallible();
+	loader.RegisterFunction(validate);
 
-	loader.RegisterFunction(ScalarFunction("json_schema_patch", {LogicalType::JSON(), LogicalType::JSON()},
-	                                       LogicalType::JSON(), JsonSchemaPatchFun));
+	ScalarFunction patch("json_schema_patch", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::JSON(),
+	                     JsonSchemaPatchFun);
+	patch.SetFallible();
+	loader.RegisterFunction(patch);
 
-	loader.RegisterFunction(ScalarFunction("json_schema_update", {LogicalType::JSON(), LogicalType::JSON()},
-	                                       LogicalType::JSON(), JsonSchemaUpdateFun));
+	ScalarFunction update("json_schema_update", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::JSON(),
+	                      JsonSchemaUpdateFun);
+	update.SetFallible();
+	loader.RegisterFunction(update);
 
 	QueryFarmSendTelemetry(loader, "json_schema", "2026072501");
 }
