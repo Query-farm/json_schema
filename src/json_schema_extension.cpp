@@ -1,130 +1,165 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "json_schema_extension.hpp"
-#include "duckdb.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
-#include "duckdb/common/vector/string_vector.hpp"
-#include "nlohmann/json-schema.hpp"
-#include "query_farm_telemetry.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/extension_load_options.hpp"
+#include "duckdb/main/extension_repository_manager.hpp"
+
+// For DuckDB 2.0 and later this extension is distributed from the Query.Farm extension repository. The build published to the
+// DuckDB community repository only keeps the name. When the user has already added the Query.Farm repository and
+// installed the extension from it, loading this build loads that one; otherwise it explains the remaining steps.
+// It never adds the repository or installs anything itself: trusting a repository is the user's decision.
 
 namespace duckdb {
 
-inline void JsonSchemaValidateSchemaFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &schema_vector = args.data[0];
+static constexpr const char *EXTENSION_NAME = "json_schema";
+static constexpr const char *EXTENSION_VERSION = "2026102001";
+static constexpr const char *REPOSITORY_NAME = "query_farm";
+static constexpr const char *REPOSITORY_URL = "https://duckdb-extensions.query.farm";
+static constexpr const char *REPOSITORY_HTTP_URL = "http://duckdb-extensions.query.farm";
+// sha256 fingerprints of the Query.Farm repository signing keys (primary and standby)
+static constexpr const char *REPOSITORY_KEY_FINGERPRINTS[] = {
+    "sha256:b293ba6145db8f51f301618f59a720cb8c0c21e7efc6119aab43ea5c708947b5",
+    "sha256:6959de1c16b783b14d4c904f69361811f737017d79ea7078729a74ec2f7f7753"};
 
-	nlohmann::json_schema::json_validator validator;
-	UnaryExecutor::Execute<string_t, bool>(schema_vector, result, [&](string_t schema) {
-		try {
-			nlohmann::json parsed = nlohmann::json::parse(schema.GetString());
-			validator.set_root_schema(parsed);
-		} catch (const std::exception &e) {
-			throw InvalidInputException("Validation of JSON schema failed: " + string(e.what()) +
-			                            "\nSchema: " + schema.GetString());
+static string MovedPreamble() {
+	return StringUtil::Format("The %s extension for DuckDB 2.0 and later is distributed from the Query.Farm extension repository, "
+	                          "not the DuckDB community repository.\n\n",
+	                          EXTENSION_NAME);
+}
+
+static string MoreInformation() {
+	return StringUtil::Format("\n\nMore information: https://query.farm/products/extensions/%s/", EXTENSION_NAME);
+}
+
+static bool IsInstalledFromRepository(DatabaseInstance &db, FileSystem &fs) {
+	for (auto &directory : ExtensionHelper::GetExtensionDirectoryPath(db, fs)) {
+		auto path = fs.JoinPath(fs.JoinPath(fs.JoinPath(directory, "repositories"), REPOSITORY_NAME),
+		                        string(EXTENSION_NAME) + ".duckdb_extension");
+		if (fs.FileExists(path)) {
+			return true;
 		}
-		return true;
-	});
+	}
+	return false;
 }
 
-inline void JsonSchemaValidateFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &schema_vector = args.data[0];
-	auto &value_vector = args.data[1];
-
-	BinaryExecutor::Execute<string_t, string_t, bool>(
-	    schema_vector, value_vector, result, [&](string_t schema, string_t value) {
-		    try {
-			    nlohmann::json_schema::json_validator validator; // create validator
-			    nlohmann::json parsed_schema = nlohmann::json::parse(schema.GetString());
-
-			    validator.set_root_schema(parsed_schema);
-			    nlohmann::json parsed_value = nlohmann::json::parse(value.GetString());
-			    validator.validate(parsed_value);
-		    } catch (const std::exception &e) {
-			    throw InvalidInputException("Validation of JSON schema failed, here is why: " + string(e.what()) +
-			                                "\nValue: " + value.GetString());
-		    }
-		    return true;
-	    });
+// A repository named query_farm is only used when it points at the Query.Farm prefix and pins a Query.Farm signing key.
+static bool IsQueryFarmRepository(const ExtensionRepository &repository) {
+	auto prefix = StringUtil::Lower(repository.path);
+	while (StringUtil::EndsWith(prefix, "/")) {
+		prefix.pop_back();
+	}
+	if (prefix != REPOSITORY_URL && prefix != REPOSITORY_HTTP_URL) {
+		return false;
+	}
+	for (auto &key : repository.public_keys) {
+		auto fingerprint = ExtensionRepositoryManager::GetPublicKeyFingerprint(key);
+		for (auto trusted : REPOSITORY_KEY_FINGERPRINTS) {
+			if (fingerprint == trusted) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
-inline void JsonSchemaPatchFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &schema_vector = args.data[0];
-	auto &value_vector = args.data[1];
+static void LoadFromQueryFarmOrExplain(DatabaseInstance &db) {
+	auto &fs = FileSystem::GetFileSystem(db);
+	ExtensionRepository repository;
+	bool has_repository = ExtensionRepositoryManager::TryGetRepository(db, fs, REPOSITORY_NAME, repository);
 
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    schema_vector, value_vector, result, [&](string_t schema, string_t value) {
-		    try {
-			    nlohmann::json_schema::json_validator validator; // create validator
-			    nlohmann::json parsed_schema = nlohmann::json::parse(schema.GetString());
-			    validator.set_root_schema(parsed_schema);
+	if (!has_repository) {
+		throw MissingExtensionException(
+		    "%sAdd the repository and install the extension once:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE EXTENSION REPOSITORY IF NOT EXISTS %s WITH PREFIX '%s';\n"
+		    "    INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME,
+		    REPOSITORY_NAME, MoreInformation());
+	}
+	if (!IsQueryFarmRepository(repository)) {
+		throw MissingExtensionException(
+		    "%sA repository named %s is configured with the prefix '%s', but it is not the Query.Farm extension "
+		    "repository: it points somewhere else or does not use the Query.Farm signing keys, so the extension is not "
+		    "loaded from it. Replace it with the Query.Farm repository and reinstall the extension:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, repository.path, REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME,
+		    REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
+	if (ExtensionRepositoryManager::GetAccess(db) == ExtensionRepositoryAccess::FORBIDDEN) {
+		throw MissingExtensionException("%sThe %s repository is configured, but allow_extension_repositories is set to "
+		                                "'forbidden', so extensions from it cannot be loaded.%s",
+		                                MovedPreamble(), REPOSITORY_NAME, MoreInformation());
+	}
+	if (!IsInstalledFromRepository(db, fs)) {
+		throw MissingExtensionException("%sThe %s repository is already configured. Install the extension from it once:\n"
+		                                "\n"
+		                                "    SET allow_extension_repositories = 'allowed';\n"
+		                                "    INSTALL %s FROM %s;\n"
+		                                "\n"
+		                                "Then load it in each session with:\n"
+		                                "\n"
+		                                "    LOAD %s FROM %s;%s",
+		                                MovedPreamble(), REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME,
+		                                EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
 
-			    nlohmann::json parsed_value = nlohmann::json::parse(value.GetString());
-			    auto patch = validator.validate(parsed_value);
-			    return StringVector::AddString(result, patch.dump());
-		    } catch (const std::exception &e) {
-			    throw InvalidInputException("Validation of JSON schema failed, here is why: " + string(e.what()) +
-			                                "\nValue: " + value.GetString());
-		    }
-	    });
+	// The repository is trusted and the extension is installed from it: load that build. DuckDB holds the load lock
+	// for this name while this stub initializes, so the real extension is loaded under an alias; its functions are
+	// registered as usual.
+	ExtensionLoadOptions options(EXTENSION_NAME);
+	options.repository = REPOSITORY_NAME;
+	options.alias = Identifier(string(EXTENSION_NAME) + "_" + REPOSITORY_NAME);
+	try {
+		ExtensionHelper::LoadExternalExtension(db, fs, options);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (error.Type() != ExceptionType::IO || !StringUtil::Contains(error.RawMessage(), "signature")) {
+			throw;
+		}
+		throw MissingExtensionException(
+		    "%sThe %s extension installed from the %s repository failed signature verification. The file may be "
+		    "damaged, or it was signed with a key that this repository definition does not trust. Reinstall it:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "If loading still fails the same way, refresh the repository's signing keys and reinstall:\n"
+		    "\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Do not use -unsigned to work around this.%s",
+		    MovedPreamble(), EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, REPOSITORY_NAME,
+		    REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
+	}
 }
 
-inline void JsonSchemaUpdateFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &schema_vector = args.data[0];
-	auto &value_vector = args.data[1];
-
-	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    schema_vector, value_vector, result, [&](string_t schema, string_t value) {
-		    try {
-			    nlohmann::json_schema::json_validator validator; // create validator
-			    nlohmann::json parsed_schema = nlohmann::json::parse(schema.GetString());
-			    validator.set_root_schema(parsed_schema);
-
-			    nlohmann::json parsed_value = nlohmann::json::parse(value.GetString());
-			    auto patch = validator.validate(parsed_value);
-			    auto updated = parsed_value.patch(patch);
-			    return StringVector::AddString(result, updated.dump());
-		    } catch (const std::exception &e) {
-			    throw InvalidInputException("Validation of JSON schema failed, here is why: " + string(e.what()) +
-			                                "\nValue: " + value.GetString());
-		    }
-	    });
+void Json_schemaExtension::Load(ExtensionLoader &loader) {
+	LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
 }
 
-static void LoadInternal(ExtensionLoader &loader) {
-	// All functions raise an error on invalid JSON / schemas, so they must be marked as fallible.
-	ScalarFunction validate_schema("json_schema_validate_schema", {LogicalType::JSON()}, LogicalType::BOOLEAN,
-	                               JsonSchemaValidateSchemaFun);
-	validate_schema.SetFallible();
-	loader.RegisterFunction(validate_schema);
-
-	ScalarFunction validate("json_schema_validate", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::BOOLEAN,
-	                        JsonSchemaValidateFun);
-	validate.SetFallible();
-	loader.RegisterFunction(validate);
-
-	ScalarFunction patch("json_schema_patch", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::JSON(),
-	                     JsonSchemaPatchFun);
-	patch.SetFallible();
-	loader.RegisterFunction(patch);
-
-	ScalarFunction update("json_schema_update", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::JSON(),
-	                      JsonSchemaUpdateFun);
-	update.SetFallible();
-	loader.RegisterFunction(update);
-
-	QueryFarmSendTelemetry(loader, "json_schema", "2026102001");
+std::string Json_schemaExtension::Name() {
+	return EXTENSION_NAME;
 }
 
-void JsonSchemaExtension::Load(ExtensionLoader &loader) {
-	LoadInternal(loader);
-}
-std::string JsonSchemaExtension::Name() {
-	return "json_schema";
-}
-
-std::string JsonSchemaExtension::Version() const {
-	return "2026102001";
+std::string Json_schemaExtension::Version() const {
+	return EXTENSION_VERSION;
 }
 
 } // namespace duckdb
@@ -132,6 +167,6 @@ std::string JsonSchemaExtension::Version() const {
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(json_schema, loader) {
-	duckdb::LoadInternal(loader);
+	duckdb::LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
 }
 }
