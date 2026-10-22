@@ -1,0 +1,35 @@
+# name: test/sql/json_schema_parameter_names.test
+# description: every function parameter is reported with a real name, not col0, col1, ...
+# group: [sql]
+
+require json_schema
+
+require json
+
+query IIT
+SELECT function_name, function_type, parameters FROM duckdb_functions()
+WHERE extension_name = 'json_schema'
+ORDER BY function_name, function_type, len(parameters), parameter_types::VARCHAR;
+----
+json_schema_patch	scalar	[schema, json_data]
+json_schema_update	scalar	[schema, json_data]
+json_schema_validate	scalar	[schema, json_data]
+json_schema_validate_schema	scalar	[schema]
+
+# No parameter may fall back to a positional colN name
+query I
+SELECT count(*) FROM (SELECT unnest(parameters) AS p FROM duckdb_functions() WHERE extension_name = 'json_schema')
+WHERE regexp_matches(p, '^col[0-9]+$');
+----
+0
+
+# Positional calls work as before
+query I
+SELECT json_schema_validate_schema('{"type": "object"}');
+----
+true
+
+query I
+SELECT json_schema_validate('{"type": "object", "properties": {"id": {"type": "integer"}}}', {'id': 5});
+----
+true

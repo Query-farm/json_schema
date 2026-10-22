@@ -11,6 +11,11 @@
 
 namespace duckdb {
 
+//! A positional-only parameter with a real name (bare types would be reported as col0, col1, ...)
+static FunctionParameter Positional(const char *name, LogicalType type) {
+	return FunctionParameter(name, std::move(type), {}, FunctionParameterKind::POSITIONAL_ONLY);
+}
+
 inline void JsonSchemaValidateSchemaFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &schema_vector = args.data[0];
 
@@ -93,27 +98,30 @@ inline void JsonSchemaUpdateFun(DataChunk &args, ExpressionState &state, Vector 
 
 static void LoadInternal(ExtensionLoader &loader) {
 	// All functions raise an error on invalid JSON / schemas, so they must be marked as fallible.
-	ScalarFunction validate_schema("json_schema_validate_schema", {LogicalType::JSON()}, LogicalType::BOOLEAN,
-	                               JsonSchemaValidateSchemaFun);
+	ScalarFunction validate_schema("json_schema_validate_schema", {Positional("schema", LogicalType::JSON())},
+	                               LogicalType::BOOLEAN, JsonSchemaValidateSchemaFun);
 	validate_schema.SetFallible();
 	loader.RegisterFunction(validate_schema);
 
-	ScalarFunction validate("json_schema_validate", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::BOOLEAN,
-	                        JsonSchemaValidateFun);
+	ScalarFunction validate("json_schema_validate",
+	                        {Positional("schema", LogicalType::JSON()), Positional("json_data", LogicalType::JSON())},
+	                        LogicalType::BOOLEAN, JsonSchemaValidateFun);
 	validate.SetFallible();
 	loader.RegisterFunction(validate);
 
-	ScalarFunction patch("json_schema_patch", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::JSON(),
-	                     JsonSchemaPatchFun);
+	ScalarFunction patch("json_schema_patch",
+	                     {Positional("schema", LogicalType::JSON()), Positional("json_data", LogicalType::JSON())},
+	                     LogicalType::JSON(), JsonSchemaPatchFun);
 	patch.SetFallible();
 	loader.RegisterFunction(patch);
 
-	ScalarFunction update("json_schema_update", {LogicalType::JSON(), LogicalType::JSON()}, LogicalType::JSON(),
-	                      JsonSchemaUpdateFun);
+	ScalarFunction update("json_schema_update",
+	                      {Positional("schema", LogicalType::JSON()), Positional("json_data", LogicalType::JSON())},
+	                      LogicalType::JSON(), JsonSchemaUpdateFun);
 	update.SetFallible();
 	loader.RegisterFunction(update);
 
-	QueryFarmSendTelemetry(loader, "json_schema", "2026102001");
+	QueryFarmSendTelemetry(loader, "json_schema", "2026102101");
 }
 
 void JsonSchemaExtension::Load(ExtensionLoader &loader) {
@@ -124,7 +132,7 @@ std::string JsonSchemaExtension::Name() {
 }
 
 std::string JsonSchemaExtension::Version() const {
-	return "2026102001";
+	return "2026102101";
 }
 
 } // namespace duckdb
