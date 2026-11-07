@@ -1,0 +1,61 @@
+# name: test/sql/json_schema_function_metadata.test
+# description: every json_schema function is documented in duckdb_functions() with real parameter names
+# group: [sql]
+
+require json_schema
+
+require json
+
+query IIII
+SELECT function_name, parameters, parameter_types, return_type
+FROM duckdb_functions()
+WHERE function_name LIKE 'json\_schema\_%' ESCAPE '\'
+ORDER BY function_name;
+----
+json_schema_errors	[schema, json_data]	[JSON, JSON]	STRUCT(path VARCHAR, keyword VARCHAR, message VARCHAR)[]
+json_schema_is_valid	[schema, json_data]	[JSON, JSON]	BOOLEAN
+json_schema_patch	[schema, json_data]	[JSON, JSON]	JSON
+json_schema_update	[schema, json_data]	[JSON, JSON]	JSON
+json_schema_validate	[schema, json_data]	[JSON, JSON]	BOOLEAN
+json_schema_validate_schema	[schema]	[JSON]	BOOLEAN
+
+# Every function has a description, at least one example and categories
+query I
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_name LIKE 'json\_schema\_%' ESCAPE '\'
+  AND (description IS NULL OR description = ''
+       OR examples IS NULL OR len(examples) = 0
+       OR categories IS NULL OR len(categories) = 0
+       OR len(parameters) <> len(parameter_types)
+       OR len(list_filter(parameters, lambda p: regexp_matches(p, '^col[0-9]+$'))) > 0)
+ORDER BY function_name;
+----
+
+query II
+SELECT function_name, categories FROM duckdb_functions()
+WHERE function_name LIKE 'json\_schema\_%' ESCAPE '\'
+ORDER BY function_name;
+----
+json_schema_errors	[json, validation]
+json_schema_is_valid	[json, validation]
+json_schema_patch	[json, validation]
+json_schema_update	[json, validation]
+json_schema_validate	[json, validation]
+json_schema_validate_schema	[json, validation]
+
+query I
+SELECT stability FROM duckdb_functions() WHERE function_name = 'json_schema_is_valid';
+----
+CONSISTENT
+
+# Every documented example runs
+query I
+SELECT json_schema_is_valid('{"type": "integer", "minimum": 0}', '-1');
+----
+false
+
+query III
+SELECT e.path, e.keyword, e.message FROM (SELECT unnest(json_schema_errors('{"type": "object", "required": ["id", "name"]}', '{"id": 1}')) AS e);
+----
+(empty)	required	Required property 'name' not found.

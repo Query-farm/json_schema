@@ -1,0 +1,384 @@
+# name: test/sql/json_schema_validation.test
+# description: failures, drafts, format, NULLs, table columns, caching and malformed input
+# group: [sql]
+
+require json_schema
+
+require json
+
+statement ok
+PRAGMA enable_verification
+
+# ---------------------------------------------------------------------------
+# json_schema_is_valid / json_schema_validate failures
+# ---------------------------------------------------------------------------
+query II
+SELECT json_schema_is_valid('{"type": "integer", "minimum": 0}', '5'),
+       json_schema_is_valid('{"type": "integer", "minimum": 0}', '-1');
+----
+true	false
+
+statement error
+SELECT json_schema_validate('{"type": "object", "required": ["id"]}', '{"name": "x"}');
+----
+JSON document does not match the schema: (root): Required property 'id' not found.
+
+# The error lists the failing location, never the whole document
+statement error
+SELECT json_schema_validate('{"properties": {"id": {"type": "integer"}}}', '{"id": "secret-value-xyz", "big": "payload"}');
+----
+/id: Expected integer, found string
+
+# At most five errors are listed in the message
+statement error
+SELECT json_schema_validate('{"items": {"type": "integer"}}', '["a","b","c","d","e","f","g"]');
+----
+use json_schema_errors() for the full list
+
+# ---------------------------------------------------------------------------
+# json_schema_errors
+# ---------------------------------------------------------------------------
+query I
+SELECT json_schema_errors('{"type": "object", "required": ["id"]}', '{"id": 1}');
+----
+[]
+
+query III
+SELECT e.path, e.keyword, e.message
+FROM (SELECT unnest(json_schema_errors('{"type": "array", "items": {"type": "integer"}}', '[1, "two", 3, true]')) AS e)
+ORDER BY e.path;
+----
+/1	type	Expected integer, found string
+/3	type	Expected integer, found boolean
+
+query I
+SELECT len(json_schema_errors('{"items": {"type": "integer"}}', '["a","b","c","d","e","f","g"]'));
+----
+7
+
+query I
+SELECT typeof(json_schema_errors('{}', '1'));
+----
+STRUCT(path VARCHAR, keyword VARCHAR, message VARCHAR)[]
+
+# ---------------------------------------------------------------------------
+# Draft 2020-12 keywords are enforced (the previous draft-07-only validator ignored them)
+# ---------------------------------------------------------------------------
+query II
+SELECT json_schema_is_valid('{"$schema": "https://json-schema.org/draft/2020-12/schema", "prefixItems": [{"type": "string"}, {"type": "integer"}]}', '["a", 1]'),
+       json_schema_is_valid('{"$schema": "https://json-schema.org/draft/2020-12/schema", "prefixItems": [{"type": "string"}, {"type": "integer"}]}', '[1, "a"]');
+----
+true	false
+
+query II
+SELECT json_schema_is_valid('{"$schema": "https://json-schema.org/draft/2020-12/schema", "properties": {"a": {}}, "unevaluatedProperties": false}', '{"a": 1}'),
+       json_schema_is_valid('{"$schema": "https://json-schema.org/draft/2020-12/schema", "properties": {"a": {}}, "unevaluatedProperties": false}', '{"a": 1, "b": 2}');
+----
+true	false
+
+query II
+SELECT json_schema_is_valid('{"dependentRequired": {"credit_card": ["billing_address"]}}', '{"credit_card": 1, "billing_address": "x"}'),
+       json_schema_is_valid('{"dependentRequired": {"credit_card": ["billing_address"]}}', '{"credit_card": 1}');
+----
+true	false
+
+query II
+SELECT json_schema_is_valid('{"$defs": {"pos": {"type": "integer", "minimum": 1}}, "$ref": "#/$defs/pos"}', '3'),
+       json_schema_is_valid('{"$defs": {"pos": {"type": "integer", "minimum": 1}}, "$ref": "#/$defs/pos"}', '0');
+----
+true	false
+
+# Draft 2019-09
+query I
+SELECT json_schema_is_valid('{"$schema": "https://json-schema.org/draft/2019-09/schema", "properties": {"a": {}}, "unevaluatedProperties": false}', '{"b": 1}');
+----
+false
+
+# Draft-07 semantics are used when the schema asks for them: array-form "items" is a tuple
+query II
+SELECT json_schema_is_valid('{"$schema": "http://json-schema.org/draft-07/schema#", "items": [{"type": "string"}], "additionalItems": false}', '["a"]'),
+       json_schema_is_valid('{"$schema": "http://json-schema.org/draft-07/schema#", "items": [{"type": "string"}], "additionalItems": false}', '["a", "b"]');
+----
+true	false
+
+query I
+SELECT json_schema_is_valid('{"$schema": "http://json-schema.org/draft-04/schema#", "type": "number", "maximum": 10, "exclusiveMaximum": true}', '10');
+----
+false
+
+query I
+SELECT json_schema_is_valid('{"$schema": "http://json-schema.org/draft-06/schema#", "const": 3}', '3');
+----
+true
+
+# An unknown draft is refused instead of being silently mis-validated
+statement error
+SELECT json_schema_validate_schema('{"$schema": "https://example.com/my-draft/schema", "type": "object"}');
+----
+Invalid JSON schema: Unsupported schema version https://example.com/my-draft/schema
+
+# ---------------------------------------------------------------------------
+# "format" is validated (the previous validator raised an error for any schema using it)
+# ---------------------------------------------------------------------------
+query IIII
+SELECT json_schema_is_valid('{"format": "email"}', '"user@example.com"'),
+       json_schema_is_valid('{"format": "email"}', '"not an email"'),
+       json_schema_is_valid('{"format": "date-time"}', '"2024-01-02T03:04:05Z"'),
+       json_schema_is_valid('{"format": "date-time"}', '"yesterday"');
+----
+true	false	true	false
+
+query II
+SELECT json_schema_is_valid('{"format": "ipv4"}', '"192.168.0.1"'),
+       json_schema_is_valid('{"format": "ipv4"}', '"1.2.3"');
+----
+true	false
+
+# format only applies to strings
+query I
+SELECT json_schema_is_valid('{"format": "email"}', '42');
+----
+true
+
+# ---------------------------------------------------------------------------
+# pattern / patternProperties (evaluated with RE2: linear time, no recursion)
+# ---------------------------------------------------------------------------
+query II
+SELECT json_schema_is_valid('{"pattern": "^[a-z]+$"}', '"abc"'),
+       json_schema_is_valid('{"pattern": "^[a-z]+$"}', '"abc1"');
+----
+true	false
+
+# pattern is an unanchored search
+query I
+SELECT json_schema_is_valid('{"pattern": "b"}', '"abc"');
+----
+true
+
+query II
+SELECT json_schema_is_valid('{"patternProperties": {"^x-": {"type": "string"}}}', '{"x-a": "s", "y": 1}'),
+       json_schema_is_valid('{"patternProperties": {"^x-": {"type": "string"}}}', '{"x-a": 1}');
+----
+true	false
+
+# Unicode
+query II
+SELECT json_schema_is_valid('{"pattern": "^.{3}$"}', '"日本語"'),
+       json_schema_is_valid('{"type": "string", "maxLength": 2}', '"日本語"');
+----
+true	false
+
+# Catastrophic-backtracking pattern on a long input finishes immediately and does not overflow the stack
+query I
+SELECT json_schema_is_valid('{"pattern": "^(a+)+$"}', to_json(repeat('a', 100000) || 'b'));
+----
+false
+
+query I
+SELECT json_schema_is_valid('{"pattern": "^(a|b)*$"}', to_json(repeat('ab', 500000)));
+----
+true
+
+# Patterns RE2 cannot evaluate (lookaround, backreferences) are schema errors
+statement error
+SELECT json_schema_validate_schema('{"pattern": "^(?!foo)"}');
+----
+Invalid JSON schema: Invalid or unsupported regular expression
+
+statement error
+SELECT json_schema_validate_schema('{"pattern": "(a"}');
+----
+Invalid JSON schema: Invalid or unsupported regular expression
+
+query II
+SELECT json_schema_is_valid('{"format": "regex"}', '"^[a-z]+$"'),
+       json_schema_is_valid('{"format": "regex"}', '"(unclosed"');
+----
+true	false
+
+# ---------------------------------------------------------------------------
+# Malformed schemas and documents (the VARCHAR -> JSON cast rejects malformed text first)
+# ---------------------------------------------------------------------------
+statement error
+SELECT json_schema_validate_schema('{"type": "object"');
+----
+Malformed JSON
+
+statement error
+SELECT json_schema_validate_schema('42');
+----
+Invalid JSON schema: Schema must be object or boolean
+
+statement error
+SELECT json_schema_is_valid('[1, 2]', '1');
+----
+Invalid JSON schema
+
+# Boolean schemas
+query II
+SELECT json_schema_is_valid('true', '{"anything": 1}'), json_schema_is_valid('false', '1');
+----
+true	false
+
+statement error
+SELECT json_schema_is_valid('{}', '{"a":');
+----
+Malformed JSON
+
+# Remote / file references are refused: a schema never makes network or file I/O
+statement error
+SELECT json_schema_validate_schema('{"$ref": "https://example.com/other.json"}');
+----
+Invalid JSON schema: Don't know how to load JSON Schema 'https://example.com/other.json'
+
+statement error
+SELECT json_schema_validate_schema('{"$ref": "file:///etc/passwd"}');
+----
+Invalid JSON schema: Don't know how to load JSON Schema
+
+# Unresolvable local reference
+statement error
+SELECT json_schema_validate_schema('{"$ref": "#/$defs/missing"}');
+----
+Invalid JSON schema
+
+# Excessive nesting is rejected instead of exhausting the stack
+statement error
+SELECT json_schema_validate('{}', repeat('[', 300) || repeat(']', 300));
+----
+Invalid JSON document
+
+# ... and is simply not valid for json_schema_is_valid()
+query I
+SELECT json_schema_is_valid('{}', repeat('[', 300) || repeat(']', 300));
+----
+false
+
+query I
+SELECT json_schema_errors('{}', repeat('[', 300) || repeat(']', 300))[1].message LIKE 'Invalid JSON document:%';
+----
+true
+
+statement error
+SELECT json_schema_validate_schema(repeat('{"not":', 300) || '{}' || repeat('}', 300));
+----
+Invalid JSON schema: the schema is not valid JSON
+
+query I
+SELECT json_schema_is_valid('{"items": {"items": {"type": "integer"}}}', '[[1, 2], [3]]');
+----
+true
+
+# A self-referencing schema validates a nested document
+query I
+SELECT json_schema_is_valid('{"type": "array", "items": {"$ref": "#"}}', repeat('[', 12) || repeat(']', 12));
+----
+true
+
+# Deep recursion through $ref either succeeds or is stopped by the native stack guard (how deep a document
+# can be depends on the thread's stack: 8MB on Linux, 512KB on macOS workers, 128KB on musl) -- it never crashes
+statement maybe
+SELECT json_schema_is_valid('{"anyOf": [{"type": "array", "items": {"$ref": "#"}}]}', repeat('[', 255) || repeat(']', 255));
+----
+ran out of stack
+
+statement maybe
+SELECT json_schema_errors('{"$defs": {"a": {"allOf": [{"allOf": [{"allOf": [{"allOf": [{"items": {"$ref": "#/$defs/a"}, "minItems": 1}]}]}]}]}}, "$ref": "#/$defs/a"}', repeat('[', 255) || repeat(']', 255));
+----
+ran out of stack
+
+statement maybe
+SELECT json_schema_validate_schema(repeat('{"items":', 255) || '{}' || repeat('}', 255));
+----
+ran out of stack
+
+# The stack guard works on a single thread too (validation then runs on the main thread)
+statement ok
+SET threads = 1;
+
+statement maybe
+SELECT json_schema_update('{"anyOf": [{"type": "array", "items": {"$ref": "#"}}]}', repeat('[', 255) || repeat(']', 255));
+----
+ran out of stack
+
+statement ok
+RESET threads;
+
+# ---------------------------------------------------------------------------
+# NULLs
+# ---------------------------------------------------------------------------
+query IIIIII
+SELECT json_schema_validate_schema(NULL),
+       json_schema_validate(NULL, '1'),
+       json_schema_is_valid('{}', NULL),
+       json_schema_errors(NULL, '1'),
+       json_schema_patch('{}', NULL),
+       json_schema_update(NULL, NULL);
+----
+NULL	NULL	NULL	NULL	NULL	NULL
+
+# ---------------------------------------------------------------------------
+# Table columns: non-constant schemas and documents, more rows than one vector
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE docs AS
+SELECT i,
+       CASE WHEN i % 3 = 0 THEN '{"type": "integer", "multipleOf": 2}'
+            WHEN i % 3 = 1 THEN '{"type": "string"}'
+            ELSE '{"type": "array", "maxItems": 2}' END::JSON AS schema,
+       CASE WHEN i % 5 = 0 THEN NULL
+            WHEN i % 3 = 1 THEN to_json('s' || i)
+            ELSE to_json(i) END AS doc
+FROM range(10000) t(i);
+
+query III
+SELECT count(*), count(*) FILTER (WHERE json_schema_is_valid(schema, doc)), count(json_schema_is_valid(schema, doc))
+FROM docs;
+----
+10000	4000	8000
+
+query I
+SELECT count(*) FROM docs WHERE len(json_schema_errors(schema, doc)) > 0;
+----
+4000
+
+# Constant schema over a column (the compiled schema is reused)
+query I
+SELECT count(*) FILTER (WHERE json_schema_is_valid('{"type": "integer", "minimum": 5000}', to_json(i))) FROM range(10000) t(i);
+----
+5000
+
+# Many distinct schemas (more than the per-thread cache holds)
+query I
+SELECT count(*) FILTER (WHERE json_schema_is_valid(('{"const": ' || (i % 50) || '}')::JSON, to_json(i % 50))) FROM range(5000) t(i);
+----
+5000
+
+query I
+SELECT json_schema_update('{"properties": {"n": {"default": 0}}}', doc) FROM (VALUES ('{"n": 3}'::JSON), ('{}'::JSON)) t(doc) ORDER BY 1;
+----
+{"n":0}
+{"n":3}
+
+# ---------------------------------------------------------------------------
+# patch / update
+# ---------------------------------------------------------------------------
+query I
+SELECT json_schema_patch('{"properties": {"id": {"type": "integer", "default": 5}}}', '{"id": 7}');
+----
+[]
+
+statement error
+SELECT json_schema_patch('{"properties": {"id": {"type": "integer", "default": 5}}}', '{"id": "x"}');
+----
+JSON document does not match the schema: /id: Expected integer, found string
+
+statement error
+SELECT json_schema_update('{"required": ["id"]}', '{}');
+----
+JSON document does not match the schema
+
+query I
+SELECT json_schema_update('{"properties": {"name": {"type": "string", "default": "Zoë"}, "tags": {"default": []}}}', '{}');
+----
+{"name":"Zoë","tags":[]}

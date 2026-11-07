@@ -1,0 +1,293 @@
+diff --git a/include/jsoncons_ext/jsonschema/common/duckdb_support.hpp b/include/jsoncons_ext/jsonschema/common/duckdb_support.hpp
+new file mode 100644
+index 0000000..b2139fb
+--- /dev/null
++++ b/include/jsoncons_ext/jsonschema/common/duckdb_support.hpp
+@@ -0,0 +1,86 @@
++// Query.Farm patch (DuckDB json_schema extension). Schemas and documents are untrusted input:
++//
++// * schema_regex: "pattern", "patternProperties" and "format": "regex" are attacker-controlled, and
++//   std::regex backtracks recursively (stack overflow / exponential time). DuckDB's bundled RE2 is used
++//   instead: linear time, bounded memory, no recursion. RE2 does not support backreferences or lookaround;
++//   such patterns are rejected as schema errors.
++// * stack_guard: compiling and evaluating a schema recurse once per level of schema/document nesting (and
++//   per $ref hop). The host sets the lowest stack address this thread may reach; every recursion step checks
++//   it and throws a schema_error instead of overflowing the (possibly small) thread stack.
++
++#ifndef JSONCONS_EXT_JSONSCHEMA_COMMON_DUCKDB_SUPPORT_HPP
++#define JSONCONS_EXT_JSONSCHEMA_COMMON_DUCKDB_SUPPORT_HPP
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include "re2/re2.h"
++
++#include <jsoncons/config/jsoncons_config.hpp>
++#include <jsoncons_ext/jsonschema/jsonschema_error.hpp>
++
++namespace jsoncons {
++namespace jsonschema {
++
++    class stack_guard
++    {
++    public:
++        //! Lowest stack address the current thread may reach; 0 disables the check
++        static std::uintptr_t& limit()
++        {
++            static thread_local std::uintptr_t value = 0;
++            return value;
++        }
++
++        static void check()
++        {
++            volatile char marker = 0;
++            auto sp = reinterpret_cast<std::uintptr_t>(&marker);
++            auto lowest = limit();
++            if (lowest != 0 && sp < lowest)
++            {
++                JSONCONS_THROW(schema_error("JSON schema evaluation ran out of stack: the schema or document is nested too deeply"));
++            }
++        }
++    };
++
++    class schema_regex
++    {
++        std::shared_ptr<const duckdb_re2::RE2> re_;
++
++        static std::shared_ptr<const duckdb_re2::RE2> compile(const std::string& pattern)
++        {
++            duckdb_re2::RE2::Options options;
++            options.set_log_errors(false);
++            return std::make_shared<const duckdb_re2::RE2>(pattern, options);
++        }
++
++    public:
++        explicit schema_regex(const std::string& pattern)
++            : re_(compile(pattern))
++        {
++            if (!re_->ok())
++            {
++                JSONCONS_THROW(schema_error("Invalid or unsupported regular expression '" + pattern + "': " + re_->error()));
++            }
++        }
++
++        //! Whether the pattern compiles (used for "format": "regex")
++        static bool is_valid(const char* data, std::size_t length)
++        {
++            return compile(std::string(data, length))->ok();
++        }
++
++        //! Unanchored search, as ECMA-262 RegExp.prototype.test()
++        bool search(const char* data, std::size_t length) const
++        {
++            return duckdb_re2::RE2::PartialMatch(duckdb_re2::StringPiece(data, length), *re_);
++        }
++    };
++
++} // namespace jsonschema
++} // namespace jsoncons
++
++#endif // JSONCONS_EXT_JSONSCHEMA_COMMON_DUCKDB_SUPPORT_HPP
+diff --git a/include/jsoncons_ext/jsonschema/common/eval_context.hpp b/include/jsoncons_ext/jsonschema/common/eval_context.hpp
+index 25d12aa..cb794e4 100644
+--- a/include/jsoncons_ext/jsonschema/common/eval_context.hpp
++++ b/include/jsoncons_ext/jsonschema/common/eval_context.hpp
+@@ -14,6 +14,7 @@
+ #include <jsoncons/config/jsoncons_config.hpp>
+ #include <jsoncons/utility/uri.hpp>
+ #include <jsoncons_ext/jsonpointer/jsonpointer.hpp>
++#include <jsoncons_ext/jsonschema/common/duckdb_support.hpp>
+ #include <jsoncons_ext/jsonschema/jsonschema_error.hpp>
+ 
+ namespace jsoncons {
+@@ -85,6 +86,7 @@ public:
+         : dynamic_scope_ { parent.dynamic_scope_ }, eval_path_{ parent.eval_path_ },
+           flags_(parent.flags_)
+     {
++        stack_guard::check();
+         if (validator->id() || dynamic_scope_.empty())
+         {
+             dynamic_scope_.push_back(validator);
+@@ -96,6 +98,7 @@ public:
+         : dynamic_scope_ { parent.dynamic_scope_ }, eval_path_{ parent.eval_path_ },
+           flags_(flags)
+     {
++        stack_guard::check();
+         if (validator->id() || dynamic_scope_.empty())
+         {
+             dynamic_scope_.push_back(validator);
+@@ -107,6 +110,7 @@ public:
+           flags_(parent.flags_)
+           
+     {
++        stack_guard::check();
+     }
+ 
+     eval_context(const eval_context& parent, jsoncons::string_view name,
+@@ -114,12 +118,14 @@ public:
+         : dynamic_scope_{parent.dynamic_scope_}, eval_path_(parent.eval_path() / name),
+           flags_(flags)
+     {
++        stack_guard::check();
+     }
+ 
+     eval_context(const eval_context& parent, std::size_t index)
+         : dynamic_scope_{parent.dynamic_scope_}, eval_path_(parent.eval_path() / index),
+           flags_(parent.flags_)
+     {
++        stack_guard::check();
+     }
+ 
+     eval_context(const eval_context& parent, std::size_t index,
+@@ -127,6 +133,7 @@ public:
+         : dynamic_scope_{parent.dynamic_scope_}, eval_path_(parent.eval_path() / index),
+           flags_(flags)
+     {
++        stack_guard::check();
+     }
+ 
+     const std::vector<const schema_validator<Json>*>& dynamic_scope() const
+diff --git a/include/jsoncons_ext/jsonschema/common/format_validators.hpp b/include/jsoncons_ext/jsonschema/common/format_validators.hpp
+index 85be82a..4ed4ec5 100644
+--- a/include/jsoncons_ext/jsonschema/common/format_validators.hpp
++++ b/include/jsoncons_ext/jsonschema/common/format_validators.hpp
+@@ -21,7 +21,7 @@
+ #include <jsoncons_ext/jsonschema/common/validator.hpp>
+ 
+ #if defined(JSONCONS_HAS_STD_REGEX)
+-#include <regex>
++#include <jsoncons_ext/jsonschema/common/duckdb_support.hpp>
+ #endif
+ 
+ namespace jsoncons {
+@@ -1235,15 +1235,11 @@ namespace jsonschema {
+         jsoncons::optional<Json>& patch) 
+     {
+ #if defined(JSONCONS_HAS_STD_REGEX)
+-        JSONCONS_TRY 
+-        {
+-            std::regex re(sv.data(), sv.size(), std::regex::ECMAScript);
+-        }
+-        JSONCONS_CATCH(...) 
++        if (!schema_regex::is_valid(sv.data(), sv.size()))
+         {
+             std::string message{"'"};
+             message.append(sv.data(), sv.size());
+-            message.append("' is not a valid ECMAScript regular expression. ");
++            message.append("' is not a valid (or supported) regular expression. ");
+             walk_state result = reporter.error(message_factory.make_validation_message(
+                 eval_path, 
+                 instance_location, 
+diff --git a/include/jsoncons_ext/jsonschema/common/keyword_validator.hpp b/include/jsoncons_ext/jsonschema/common/keyword_validator.hpp
+index 45e9040..c3bf327 100644
+--- a/include/jsoncons_ext/jsonschema/common/keyword_validator.hpp
++++ b/include/jsoncons_ext/jsonschema/common/keyword_validator.hpp
+@@ -34,7 +34,7 @@
+ #include <jsoncons_ext/jsonschema/common/validator.hpp>
+ 
+ #if defined(JSONCONS_HAS_STD_REGEX)
+-#include <regex>
++#include <jsoncons_ext/jsonschema/common/duckdb_support.hpp>
+ #endif
+ 
+ namespace jsoncons {
+@@ -615,11 +615,11 @@ namespace jsonschema {
+         using keyword_validator_ptr_type = std::unique_ptr<keyword_validator<Json>>;
+ 
+         std::string pattern_string_;
+-        std::regex regex_;
++        schema_regex regex_;
+ 
+     public:
+         pattern_validator(const Json& schema, const uri& schema_location, const std::string& custom_message,
+-            const std::string& pattern_string, const std::regex& regex)
++            const std::string& pattern_string, const schema_regex& regex)
+             : keyword_validator<Json>("pattern", schema, schema_location, custom_message), 
+               pattern_string_(pattern_string), regex_(regex)
+         {
+@@ -640,7 +640,8 @@ namespace jsonschema {
+ 
+             eval_context<Json> this_context(context, this->keyword());
+ 
+-            if (!std::regex_search(instance.as_cstring(), regex_))
++            auto instance_sv = instance.as_string_view();
++            if (!regex_.search(instance_sv.data(), instance_sv.size()))
+             {
+                 std::string message("String '");
+                 message.append(instance.as_cstring());
+@@ -2716,11 +2717,11 @@ namespace jsonschema {
+         using keyword_validator_ptr_type = typename keyword_validator<Json>::keyword_validator_ptr_type;
+         using schema_validator_ptr_type = typename schema_validator<Json>::schema_validator_ptr_type;
+ 
+-        std::vector<std::pair<std::regex, schema_validator_ptr_type>> pattern_properties_;
++        std::vector<std::pair<schema_regex, schema_validator_ptr_type>> pattern_properties_;
+ 
+     public:
+         pattern_properties_validator(const Json& schema, const uri& schema_location, const std::string& custom_message,
+-            std::vector<std::pair<std::regex, schema_validator_ptr_type>>&& pattern_properties)
++            std::vector<std::pair<schema_regex, schema_validator_ptr_type>>&& pattern_properties)
+             : keyword_validator<Json>("patternProperties", schema, std::move(schema_location), custom_message),
+               pattern_properties_(std::move(pattern_properties))
+         {
+@@ -2754,7 +2755,7 @@ namespace jsonschema {
+                 // check all matching "patternProperties"
+                 for (auto& schema_pp : pattern_properties_)
+                 {
+-                    if (std::regex_search(prop.key(), schema_pp.first)) 
++                    if (schema_pp.first.search(prop.key().data(), prop.key().size())) 
+                     {
+                         allowed_properties.insert(std::string(prop.name()));
+                         std::size_t errors = reporter.error_count();
+@@ -2802,7 +2803,7 @@ namespace jsonschema {
+                 // check all matching "patternProperties"
+                 for (auto& schema_pp : pattern_properties_)
+                 {
+-                    if (std::regex_search(prop.key(), schema_pp.first)) 
++                    if (schema_pp.first.search(prop.key().data(), prop.key().size())) 
+                     {
+                         allowed_properties.insert(std::string(prop.name()));
+                         result = schema_pp.second->walk(prop_context, prop.value() , prop_location, reporter, patch);
+diff --git a/include/jsoncons_ext/jsonschema/common/keyword_validator_factory.hpp b/include/jsoncons_ext/jsonschema/common/keyword_validator_factory.hpp
+index 11cc344..f3939c9 100644
+--- a/include/jsoncons_ext/jsonschema/common/keyword_validator_factory.hpp
++++ b/include/jsoncons_ext/jsonschema/common/keyword_validator_factory.hpp
+@@ -84,14 +84,14 @@ namespace jsonschema {
+             uri schema_location = context.get_base_uri();
+             std::string custom_message = context.get_custom_message(keyword);
+ 
+-            std::vector<std::pair<std::regex, schema_validator_ptr_type>> pattern_properties;
++            std::vector<std::pair<schema_regex, schema_validator_ptr_type>> pattern_properties;
+             
+             for (const auto& prop : sch.object_range())
+             {
+                 jsoncons::string_view sub_keys[] = {keyword};
+                 pattern_properties.emplace_back(
+                     std::make_pair(
+-                        std::regex(prop.key(), std::regex::ECMAScript),
++                        schema_regex(prop.key()),
+                         factory_->make_cross_draft_schema_validator(context, prop.value(), sub_keys, anchor_dict)));
+                 
+             }
+@@ -456,7 +456,7 @@ namespace jsonschema {
+         {
+             uri schema_location = context.make_schema_location("pattern");
+             auto pattern_string = sch.template as<std::string>();
+-            auto regex = std::regex(pattern_string, std::regex::ECMAScript);
++            auto regex = schema_regex(pattern_string);
+             return jsoncons::make_unique<pattern_validator<Json>>(parent, schema_location, context.get_custom_message("pattern"), 
+                 pattern_string, regex);
+         }
+diff --git a/include/jsoncons_ext/jsonschema/common/schema_validator_factory_base.hpp b/include/jsoncons_ext/jsonschema/common/schema_validator_factory_base.hpp
+index 627180a..5e721ea 100644
+--- a/include/jsoncons_ext/jsonschema/common/schema_validator_factory_base.hpp
++++ b/include/jsoncons_ext/jsonschema/common/schema_validator_factory_base.hpp
+@@ -275,6 +275,7 @@ namespace jsonschema {
+         schema_validator_ptr_type make_cross_draft_schema_validator(const compilation_context<Json>& context, 
+             const Json& sch, jsoncons::span<const jsoncons::string_view> keys, anchor_uri_map_type& anchor_dict)
+         {
++            stack_guard::check();
+             schema_validator_ptr_type schema_val = schema_validator_ptr_type{};
+             switch (sch.type())
+             {
