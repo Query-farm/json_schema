@@ -3,6 +3,7 @@
 #include "json_schema_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
@@ -151,6 +152,46 @@ static json ParseJson(string_t text) {
 	return json::parse(jsoncons::string_view(text.GetData(), text.GetSize()), options);
 }
 
+//! jsoncons only recognises the exact canonical meta-schema URIs. Schemas in the wild spell them with either
+//! scheme and with or without the empty fragment ("https://json-schema.org/draft-07/schema",
+//! "https://json-schema.org/draft/2020-12/schema#"), so map those spellings to the canonical URI.
+static void NormalizeSchemaVersion(json &schema_json) {
+	if (!schema_json.is_object()) {
+		return;
+	}
+	auto it = schema_json.find("$schema");
+	if (it == schema_json.object_range().end() || !it->value().is_string()) {
+		return;
+	}
+	auto uri = it->value().as<std::string>();
+	string rest = uri;
+	if (StringUtil::StartsWith(rest, "https://")) {
+		rest = rest.substr(8);
+	} else if (StringUtil::StartsWith(rest, "http://")) {
+		rest = rest.substr(7);
+	} else {
+		return;
+	}
+	while (!rest.empty() && rest.back() == '#') {
+		rest.pop_back();
+	}
+	static const std::pair<const char *, string> CANONICAL[] = {
+	    {"json-schema.org/draft-04/schema", jsonschema::schema_version::draft4()},
+	    {"json-schema.org/draft-06/schema", jsonschema::schema_version::draft6()},
+	    {"json-schema.org/draft-07/schema", jsonschema::schema_version::draft7()},
+	    {"json-schema.org/draft/2019-09/schema", jsonschema::schema_version::draft201909()},
+	    {"json-schema.org/draft/2020-12/schema", jsonschema::schema_version::draft202012()},
+	};
+	for (auto &entry : CANONICAL) {
+		if (rest == entry.first) {
+			if (uri != entry.second) {
+				schema_json["$schema"] = entry.second;
+			}
+			return;
+		}
+	}
+}
+
 static unique_ptr<compiled_schema_t> CompileSchema(string_t schema_text) {
 	json schema_json;
 	try {
@@ -158,6 +199,7 @@ static unique_ptr<compiled_schema_t> CompileSchema(string_t schema_text) {
 	} catch (const std::exception &e) {
 		throw InvalidInputException("Invalid JSON schema: the schema is not valid JSON: %s", Truncate(e.what()));
 	}
+	NormalizeSchemaVersion(schema_json);
 	try {
 		jsonschema::evaluation_options options;
 		// Validate "format" (date-time, email, ipv4, regex, ...) rather than treating it as an annotation

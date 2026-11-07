@@ -111,6 +111,16 @@ SELECT json_schema_is_valid('{"$schema": "http://json-schema.org/draft-06/schema
 ----
 true
 
+# Common spellings of the meta-schema URIs (either scheme, with or without the empty fragment) are accepted
+query IIIII
+SELECT json_schema_is_valid('{"$schema": "https://json-schema.org/draft-07/schema", "items": [{"type": "string"}], "additionalItems": false}', '["a", "b"]'),
+       json_schema_is_valid('{"$schema": "http://json-schema.org/draft-07/schema", "type": "string"}', '"x"'),
+       json_schema_is_valid('{"$schema": "https://json-schema.org/draft/2020-12/schema#", "prefixItems": [{"type": "string"}]}', '[1]'),
+       json_schema_is_valid('{"$schema": "http://json-schema.org/draft/2019-09/schema", "type": "string"}', '"x"'),
+       json_schema_is_valid('{"$schema": "https://json-schema.org/draft-04/schema#", "type": "string"}', '"x"');
+----
+false	true	false	true	true
+
 # An unknown draft is refused instead of being silently mis-validated
 statement error
 SELECT json_schema_validate_schema('{"$schema": "https://example.com/my-draft/schema", "type": "object"}');
