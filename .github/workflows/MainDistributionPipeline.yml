@@ -25,7 +25,7 @@ jobs:
       groups: |
         main:
           config: extension_config.cmake
-          toolchain: rust
+          toolchain: main
     secrets:
       ccache_remote_token: ${{ secrets.QUERY_FARM_CCACHE_TOKEN }}
   duckdb-deploy:
